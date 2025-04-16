@@ -13,13 +13,14 @@
 #define SAMPLING_FREQUENCY 1000   //Hz, must be less than 10000 due to ADC
 #define LOWER_BIN_THRESHOLD 65    //ignore spectral leakage from massive DC spike but also keep space for low E tuning
 #define UPPER_BIN_THRESHOLD 350   //why do we need to keep looking at bins if we passed the high E string?
-#define MAGNITUDE_THRESHOLD 10000  //put this right above noise level. the lower it is the more sustain the strings get
+#define MAGNITUDE_THRESHOLD 5000  //put this right above noise level. the lower it is the more sustain the strings get
 #define ERROR -1                  //this means the string hasn't been plucked yet
 #define HARMONIC_TOLERANCE 5      //harmonics are ideally multiples but there is normally a slight mismatch
 #define INITAL_SPIKE_DELAY 25     //ignore initial readings of guitar spike. i quite like this cuz initial readings were always dog
 #define SNR_THRESHOLD 2           //signal to noise ratio. fundamental freq at its weakest should be this ratio bigger than the strongest noise
 #define ADC_THRESHOLD 2500        //DC bias of mic is 1.65V. ADC goes from 0-4095. DC bias is at 2000 with some noise.
 
+//oled parameters
 #define SCREEN_WIDTH 128     // OLED display width, in pixels
 #define SCREEN_HEIGHT 32     // OLED display height, in pixels
 #define OLED_RESET -1        // Reset pin # (or -1 if sharing Arduino reset pin)
@@ -37,6 +38,7 @@ double vReal[SAMPLES];
 double vImag[SAMPLES];
 uint16_t prevMaxSpike = 0;
 uint8_t signalDyingFlag = 0;
+static int prevFundamentalFreq = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -54,8 +56,7 @@ void setup() {
 }
 
 void loop() {
-  /*SAMPLING*/
-  /*Dorjee's Notes: Get N(512) samples of ADC values in vReal array. Make sure 1ms passes between each sample*/
+  /*Sample the ADC pin in vReal*/
   uint8_t reset = 0;
   uint16_t tempSpikeHolder = 0;
   for (int i = 0; i < SAMPLES; i++) {
@@ -73,6 +74,7 @@ void loop() {
       reset = 1;
       delay(INITAL_SPIKE_DELAY);
     }
+
     while (micros() < (microseconds + sampling_period_us)) {  //this ensures 1ms passes before getting next sample. defines the sampling period
     }
   }
@@ -105,24 +107,19 @@ if the new peak is not a harmonic, that means it is the new fundamental frequenc
 //vD[i] is the current frequency bin value
 //vD[indexOfMaxY] is the most recent greatest peak
 double findFundamentalFrequency(double *vD, uint16_t samples, double samplingFrequency) {
-  double maxY = 0;           //store max bin value frequency
+  double maxY = 0;           //store max bin magnitude value
   uint16_t IndexOfMaxY = 0;  //store bin number here
   int oldFreq = 0;
   int newFreq = 0;
-  int fundamentalFreqFound = 0;      //this is a flag
-  int index = 0;                     //index for the peak storage array
-  int peaks[20];                     //arbitrary 20 cuz there wont be 20 peaks. will make magic number later
-  double deltaHarmonic = 0;          //to interpolate harmonic frequency
-  double interpolatedXHarmonic = 0;  //interpolate harmonic frequency
-  double harmonicRatio = 1;          //start at 1 so i dont divide by 0
-  int missedFundamentalFreq = 0;
+  uint8_t fundamentalFreqFound = 0;
 
   Serial.println("Enter Function\n");
 
-  for (uint16_t i = 1; i < ((samples >> 1) - 1); i++) {                                                          //go through half of samples cuz other half is repeat
-    if ((vD[i - 1] < vD[i]) && (vD[i] > vD[i + 1]) && (i > LOWER_BIN_THRESHOLD) && (i < UPPER_BIN_THRESHOLD)) {  //check neighbor bins
-
-      //debug print messages to get a nice view of all the peaks with their frequency and magnitude
+  //check all relevant fft bins
+  for (uint16_t i = 1; i < ((samples >> 1) - 1); i++) {
+    //identify all peaks that are above noise threshold
+    if ((vD[i - 1] < vD[i]) && (vD[i] > vD[i + 1]) && (i > LOWER_BIN_THRESHOLD) && (i < UPPER_BIN_THRESHOLD) && (vD[i] > MAGNITUDE_THRESHOLD)) {  //check neighbor bins
+      //debug print messages to see the relevant peaks and their magnitudes
       double Newdelta = 0.5 * ((vD[i - 1] - vD[i + 1]) / (vD[i - 1] - (2.0 * vD[i]) + vD[i + 1]));
       double NewinterpolatedX = ((i + Newdelta) * samplingFrequency) / (samples - 1);
       newFreq = (int)NewinterpolatedX;
@@ -131,70 +128,13 @@ double findFundamentalFrequency(double *vD, uint16_t samples, double samplingFre
       Serial.print(", Mag: ");
       Serial.println(vD[i], 4);
 
-      if (vD[i] > maxY) {  //ignore irrelevant new peaks that are smaller than previous peak
-                           //create an array of all the peaks that could realistically have been fundamental freq. will be used for post processing
-                           //this is not fool proof, but its pretty decent
-        peaks[index] = i;
-        index++;
-
-        //first, test for a fundamental frequency
-        if ((!fundamentalFreqFound)) {
-          //does it have a magnitude greater than noise threshold?
-          if ((vD[i] > MAGNITUDE_THRESHOLD)) {  //
-            //check if the current peak is a harmonic of the previous
-            if (checkHarmonic(IndexOfMaxY, i, HARMONIC_TOLERANCE)) {
-              //if the current peak is a harmonic, and the previous peak was relatively large, the previous peak was fundamental
-              if (vD[IndexOfMaxY] > (MAGNITUDE_THRESHOLD / 4)) {
-                //this is a harmonic of the actual fundamental frequency which was missed
-                missedFundamentalFreq = 1;
-                //Serial.println("FUNDAMENTAL FREQUENCY HAS BEEN FOUND USING HARMONIC");
-                maxY = vD[i];
-                IndexOfMaxY = i;
-                fundamentalFreqFound = 1;
-              }
-            }
-            //if the current peak isn't a harmonic of the actual fundamental freq, then this is the new fundamental freq
-            if (!missedFundamentalFreq) {
-              //Serial.println("FUNDAMENTAL FREQUENCY HAS BEEN FOUND");
-              maxY = vD[i];
-              IndexOfMaxY = i;
-              fundamentalFreqFound = 1;
-            }
-          }
-        }
-
-        //second, test for a harmonic
-        double Olddelta = 0.5 * ((vD[IndexOfMaxY - 1] - vD[IndexOfMaxY + 1]) / (vD[IndexOfMaxY - 1] - (2.0 * vD[IndexOfMaxY]) + vD[IndexOfMaxY + 1]));
-        double OldinterpolatedX = ((IndexOfMaxY + Olddelta) * samplingFrequency) / (samples - 1);
-        oldFreq = (int)OldinterpolatedX;
-
-        //calculate new frequency and store as int
-        double Newdelta = 0.5 * ((vD[i - 1] - vD[i + 1]) / (vD[i - 1] - (2.0 * vD[i]) + vD[i + 1]));
-        double NewinterpolatedX = ((i + Newdelta) * samplingFrequency) / (samples - 1);
-        newFreq = (int)NewinterpolatedX;
-
-        // //after the suspect fundamental freq has been found, check if the next peak is a harmonic
-        // if (fundamentalFreqFound) {
-        //   //if it isnt a harmonic, then this new peak is the new fundamental freq. if it is a harmonic, use that to improve frequency accuracy
-        //   if (!checkHarmonic(oldFreq, newFreq, HARMONIC_TOLERANCE)) {  //not a harmonic
-        //     Serial.println("CORRECTED THE FREQUENCY");
-        //     maxY = vD[i];
-        //     IndexOfMaxY = i;
-        //   } else {
-        //     //calculate the interpolated frequency of the harmonic and get the multiplicity of it compared to fundamental freq
-        //     //for now lets just deal with first harmonic
-        //     harmonicRatio = ((double)i / (double)IndexOfMaxY) + 0.2;  //bump it up 0.2 in cause u got like 163/82=1.9 -> 2.1
-        //     if ((harmonicRatio > 2) && (harmonicRatio < 3)) {
-        //       deltaHarmonic = 0.5 * ((vD[i - 1] - vD[i + 1]) / (vD[i - 1] - (2.0 * vD[i]) + vD[i + 1]));
-        //       interpolatedXHarmonic = (((i + deltaHarmonic) * samplingFrequency) / (samples - 1)) / 2;
-        //     }
-        //   }
-        // }
-
-        //only update new peak if it isnt a harmonic
-        if (!fundamentalFreqFound) {
+      //if new peak is greater than old peak and not a harmonic, update the new peak
+      if ((vD[i] > maxY) && (!checkHarmonic(IndexOfMaxY, i, HARMONIC_TOLERANCE))) {
+        //handle edge case where the fundamental freq was below noise threshold but not the harmonic
+        if (!checkHarmonic(prevFundamentalFreq, i, HARMONIC_TOLERANCE)) {
           maxY = vD[i];
           IndexOfMaxY = i;
+          fundamentalFreqFound = 1;
         }
       }
     }
@@ -202,54 +142,14 @@ double findFundamentalFrequency(double *vD, uint16_t samples, double samplingFre
 
   //nothing to calculate if we didnt find any fundamental freq
   if (!fundamentalFreqFound) {
+    prevFundamentalFreq = 0;
     return (ERROR);
   }
 
-  //POST PROCESSING for when the fundamental freq was missed and the harmonic was labeled as fundamental freq.
-  //im going to assume the harmonic is only a little bit stronger than fundamental
-  //on the other hand, a real fundamental freq would be much stronger than some random peak that came before it
-  // for (int i = index - 1; i >= 0; i--) {  //start from greatest peaks to descending order but skip the harmonic peak. update IndexOfMaxY as u go.
-  //   if (checkHarmonic(peaks[i], IndexOfMaxY, HARMONIC_TOLERANCE)) {
-  //     //if this is a harmonic, it wont be twice as big as the fundamental freq. a true fundamental freq will have a big gain over noise
-  //     if ((vD[IndexOfMaxY] / vD[peaks[i]]) < SNR_THRESHOLD) {  //(harmonic / fundamental) < 3, but (fundamental / noise) > 3.
-  //       //the current IndexOfMaxY is the harmonic. get its interpolated frequency
-  //       harmonicRatio = ((double)IndexOfMaxY / (double)peaks[i]) + 0.2;  //IndexOfMaxY:harmonic. peaks[i]: fundamental freq.
-  //       if (harmonicRatio >= 1) {                                        //avoid dividing by 0
-  //         deltaHarmonic = 0.5 * ((vD[IndexOfMaxY - 1] - vD[IndexOfMaxY + 1]) / (vD[IndexOfMaxY - 1] - (2.0 * vD[IndexOfMaxY]) + vD[IndexOfMaxY + 1]));
-  //         interpolatedXHarmonic = (((IndexOfMaxY + deltaHarmonic) * samplingFrequency) / (samples - 1)) / (int)harmonicRatio;
-  //         //return(interpolatedXHarmonic);  //this seems to be more accurate than the weak fundamental frequency?
-  //         //switch the post processed fundamental freq with the harmonic
-  //         IndexOfMaxY = peaks[i];
-  //         // Serial.print("Post Processing fundamental freq is ");
-  //         //Serial.println(peaks[i]);
-  //         //Serial.print("Fundamental freq from harmonic is ");
-  //         //Serial.println(interpolatedXHarmonic);
-  //       }
-  //     }
-  //   }
-  // }
-
-  //parabolic interpolation below for better accuracy
+  //calculate frequency from fft bin value
   double delta = 0.5 * ((vD[IndexOfMaxY - 1] - vD[IndexOfMaxY + 1]) / (vD[IndexOfMaxY - 1] - (2.0 * vD[IndexOfMaxY]) + vD[IndexOfMaxY + 1]));
   double interpolatedX = ((IndexOfMaxY + delta) * samplingFrequency) / (samples - 1);
-
-  //using harmonics to improve fundamental freq accuracy
-  double test = (interpolatedX + (interpolatedXHarmonic / 2)) / 2;  //only dealing with first harmonic rn, else need to change the inner division
-  /*
-  Serial.print("fundametnal freq from first harmonic: ");
-  Serial.println(interpolatedXHarmonic);
-
-  Serial.print("FundmaentalFreqFoundFlag = ");
-  Serial.println(fundamentalFreqFound);
-  //Serial.println(interpolatedX);
-  Serial.println();
-  */
-
-  //this handles the common case where the fundamental freq is too weak but the harmonic is strong
-  //so the fundamental freq gets missed and the harmonic gets detected
-  if (missedFundamentalFreq) {
-    return interpolatedX / 2;
-  }
+  prevFundamentalFreq = round(interpolatedX);
   return (interpolatedX);
 }
 
@@ -259,8 +159,8 @@ double findFundamentalFrequency(double *vD, uint16_t samples, double samplingFre
 uint8_t checkHarmonic(int oldFreq, int newFreq, int tolerance) {
   /*Definition of a harmonic: a multiple of at least two with a given tolerance.*/
 
+  //if oldfreq is 0, this cannot be a harmonic
   if (oldFreq == 0) {
-    Serial.println("DORJEE THERE IS AN ERROR");
     return 0;
   }
 
